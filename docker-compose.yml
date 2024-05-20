@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  microair:
+    build: .
+    environment:
+      - MAC_ADDRESS=24:DC:C3:21:05:EE
+      - CRON_SCHEDULE=*/10 * * * *
+    network_mode: "host"
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
