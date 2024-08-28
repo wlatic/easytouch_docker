@@ -1,140 +1,120 @@
-import json
 import time
-import argparse
 import logging
-from bluepy.btle import Peripheral, UUID, BTLEException, DefaultDelegate
+import json
 import os
+from bluepy.btle import Peripheral, BTLEException
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s %(levelname)s %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class NotificationDelegate(DefaultDelegate):
-    def __init__(self):
-        DefaultDelegate.__init__(self)
-        self.received_data = []
+# Define the peripheral MAC address
+mac_address = os.getenv("MAC_ADDRESS", "24:DC:C3:21:05:EE")
 
-    def handleNotification(self, cHandle, data):
-        try:
-            decoded_data = data.decode('utf-8')
-            json_data = json.loads(decoded_data)
-            logger.info("Received notification: %s", json.dumps(json_data, indent=2))
-            self.received_data.append(json_data)
-        except json.JSONDecodeError:
-            logger.warning("Received non-JSON data: %s", decoded_data)
-        except Exception as e:
-            logger.error("Error handling notification: %s", str(e))
+# Define the characteristic handle for writing and reading
+write_handle = 0x002a
+read_handle = 0x002c
 
-def send_command(char, command):
-    """Sends a command to the BLE device using the characteristic provided."""
-    try:
-        logger.debug("Sending command: %s", command)
-        char.write(command.encode('utf-8'), withResponse=True)
-        logger.debug("Command sent successfully")
-    except BTLEException as e:
-        logger.error("BLE operation failed with error: %s", e)
-        raise
+# Define the write data as a single payload
+write_data = (
+    b'{"Type":"Get Status","Zone":0,"TM":"1715308063"}'
+)
 
-def validate_temperature(temp):
-    """Validates that the temperature is within the allowed range."""
-    if temp < 60 or temp > 80:
-        raise ValueError("Temperature must be between 60°F and 80°F")
-    return temp
-
-def main(args):
-    device_mac = args.mac or os.getenv('MAC_ADDRESS')
-    logger.debug("Using MAC address: %s", device_mac)
-    if not device_mac:
-        logger.error("MAC address is not set. Use --mac option or set MAC_ADDRESS environment variable.")
-        raise Exception("MAC address is not set")
-
-    service_uuid = UUID("000000FF-0000-1000-8000-00805f9b34fb")
-    char_uuid = UUID("0000EE01-0000-1000-8000-00805f9b34fb")
-    p = None
-    try:
-        logger.debug("Connecting to device with MAC: %s", device_mac)
-        p = Peripheral(device_mac)
-        p.setDelegate(NotificationDelegate())
+def parse_zone_data(zone_data):
+    zone_status = []
+    for zone, data in zone_data.items():
+        inside_temp = data[12]
+        cooling_set_point = data[2]
+        heating_set_point = data[3]
+        mode_value = data[10]
+        mode = parse_mode(mode_value)
+        fan_setting = parse_fan_setting(data[6])
+        system_activity = data[15]
+        away_status = data[11] == 0  # New: Detect Away status
         
-        svc = p.getServiceByUUID(service_uuid)
-        char = next((c for c in svc.getCharacteristics() if c.uuid == char_uuid), None)
-        if not char:
-            logger.error("Characteristic not found")
-            raise Exception("Characteristic not found")
+        heating_on = system_activity == 4
+        cooling_on = system_activity == 2
+        
+        zone_info = {
+            "Zone": int(zone) + 1,
+            "Inside Temperature (°F)": inside_temp,
+            "Cooling Set Point (°F)": cooling_set_point,
+            "Heating Set Point (°F)": heating_set_point,
+            "Mode": mode,
+            "Fan Setting": fan_setting,
+            "System Activity": parse_system_activity(system_activity),
+            "Heating On": heating_on,
+            "Cooling On": cooling_on,
+            "Away Mode": away_status  # New: Include Away status
+        }
+        zone_status.append(zone_info)
+    return zone_status
 
-        # Enable notifications
-        p.writeCharacteristic(char.valHandle + 1, b"\x01\x00")
+def parse_mode(mode_value):
+    modes = {0: "Off", 1: "Fan Only", 2: "Cooling", 4: "Heating"}
+    return modes.get(mode_value, "Unknown")
 
-        changes = {"zone": args.zone - 1}  # Adjust for 0-based indexing
+def parse_fan_setting(fan_value):
+    fan_settings = {1: "Low", 2: "Medium", 3: "High", 128: "Auto"}
+    return fan_settings.get(fan_value, "Unknown")
 
-        if args.power is not None:
-            changes["power"] = 1 if args.power == "On" else 0
+def parse_system_activity(activity_value):
+    activities = {0: "Not Active", 2: "Cooling", 4: "Heating"}
+    return activities.get(activity_value, "Unknown")
 
-        if args.mode is not None:
-            if args.mode not in [0, 1, 2, 4]:
-                logger.error("Invalid mode")
-                raise ValueError("Invalid mode")
-            changes["mode"] = args.mode
+def parse_system_status(prm_data):
+    return {
+        "Any Zone Active": prm_data[0] == 1,
+        "System Status": prm_data[1],
+        "Away Mode": prm_data[1] == 75,  # New: Detect Away mode from PRM
+        "Unknown Value": prm_data[2],
+        "Overall Temperature": prm_data[3]
+    }
 
-        if args.fan is not None:
-            if args.fan not in [1, 2, 3, 128]:
-                logger.error("Invalid fan speed")
-                raise ValueError("Invalid fan speed")
-            if args.mode == 2:  # Cooling mode
-                changes["coolFan"] = args.fan
-            elif args.mode == 1:  # Fan only mode
-                changes["fanOnly"] = min(args.fan, 3)  # Fan only mode doesn't use 128
-
-        if any([args.cool_sp, args.heat_sp, args.dry_sp, args.auto_heat_sp, args.auto_cool_sp]):
-            if args.cool_sp: changes["cool_sp"] = validate_temperature(args.cool_sp)
-            if args.heat_sp: changes["heat_sp"] = validate_temperature(args.heat_sp)
-            if args.dry_sp: changes["dry_sp"] = validate_temperature(args.dry_sp)
-            if args.auto_heat_sp: changes["autoHeat_sp"] = validate_temperature(args.auto_heat_sp)
-            if args.auto_cool_sp: changes["autoCool_sp"] = validate_temperature(args.auto_cool_sp)
-
-        if changes:
-            command = json.dumps({"Type": "Change", "Changes": changes})
-            send_command(char, command)
-            time.sleep(1)
-
-        # Always request status after changes
-        status_command = json.dumps({"Type": "Get Status", "Zone": args.zone - 1, "TM": int(time.time())})
-        send_command(char, status_command)
-
-        # Wait for and process notifications
-        timeout = 5.0  # 5 seconds timeout
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            if p.waitForNotifications(1.0):
-                continue
-
-        logger.info("Command execution completed.")
-
+def main():
+    try:
+        # Connect to the peripheral
+        device = Peripheral(mac_address, addrType='public')
+        
+        # Perform a single Write Request
+        device.writeCharacteristic(write_handle, write_data, withResponse=True)
+        time.sleep(1.5)  # Delay after write request
+        
+        # Read Request
+        data = device.readCharacteristic(read_handle)
+        
+        # Output the complete characteristic value as JSON
+        json_data = data.decode('utf-8')
+        logger.info("Raw data received from device: %s", json_data)
+        data = json.loads(json_data)
+        
+        # Check if 'Z_sts' key exists
+        if "Z_sts" in data:
+            zone_data = data["Z_sts"]
+            zone_status = parse_zone_data(zone_data)
+            
+            system_status = parse_system_status(data.get("PRM", [0, 0, 0, 0]))
+            
+            # Combine zone status and system status
+            full_status = {
+                "System": system_status,
+                "Zones": zone_status
+            }
+            
+            # Save the status to a file
+            with open("/usr/src/app/status.json", 'w') as file:
+                json.dump(full_status, file, indent=2)
+            
+            logger.info("Status saved to /usr/src/app/status.json")
+        else:
+            logger.critical("Key 'Z_sts' not found in data. Received data: %s", data)
+        
+        # Disconnect from the peripheral
+        device.disconnect()
     except BTLEException as e:
-        logger.error("Bluetooth error: %s", e)
-        raise
-    except ValueError as e:
-        logger.error("Value error: %s", e)
-        raise
-    except Exception as e:
-        logger.error("Error: %s", e)
-        raise
-    finally:
-        if p:
-            p.disconnect()
-            logger.debug("Disconnected from device")
+        logger.critical("Bluetooth error: %s", e)
+    except json.JSONDecodeError as e:
+        logger.critical("Failed to decode JSON: %s", e)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Control a BLE HVAC system.")
-    parser.add_argument("--mac", help="MAC address of the HVAC device (overrides MAC_ADDRESS environment variable)")
-    parser.add_argument("--zone", type=int, required=True, help="Zone number to control (1-based indexing)")
-    parser.add_argument("--power", choices=["On", "Off"], help="Power state for the specified zone")
-    parser.add_argument("--mode", type=int, choices=[0, 1, 2, 4], help="Mode of operation (0: Off, 1: Fan Only, 2: Cooling, 4: Heating)")
-    parser.add_argument("--fan", type=int, choices=[1, 2, 3, 128], help="Fan setting (1: Low, 2: Medium, 3: High, 128: Auto)")
-    parser.add_argument("--cool-sp", type=int, help="Cooling setpoint (60-80°F)")
-    parser.add_argument("--heat-sp", type=int, help="Heating setpoint (60-80°F)")
-    parser.add_argument("--dry-sp", type=int, help="Dry mode setpoint (60-80°F)")
-    parser.add_argument("--auto-heat-sp", type=int, help="Auto heat setpoint (60-80°F)")
-    parser.add_argument("--auto-cool-sp", type=int, help="Auto cool setpoint (60-80°F)")
-    args = parser.parse_args()
-    main(args)
+    main()
